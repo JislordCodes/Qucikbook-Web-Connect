@@ -1,3 +1,4 @@
 sync_log.csv
 sync_state.json
 __pycache__/
+leads_*.csv
