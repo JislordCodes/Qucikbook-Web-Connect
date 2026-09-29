@@ -5,15 +5,47 @@ import html
 import datetime
 import time
 import csv
+import json
 import os
+import hmac
 
 # --- Configuration ---
-QBWC_USERNAME = "testuser"
-QBWC_PASSWORD = "testpass"
+# Credentials come from the environment. The defaults are for local demos only.
+QBWC_USERNAME = os.environ.get("QBWC_USERNAME", "testuser")
+QBWC_PASSWORD = os.environ.get("QBWC_PASSWORD", "testpass")
 LOG_FILE = 'sync_log.csv'
+STATE_FILE = 'sync_state.json'  # remembers which jobs were already synced
 LOG_FIELDS = ['Module', 'date', 'status', 'payload', 'error', 'duration']
 MAX_RETRIES = 2
+SESSION_TTL_SECONDS = 3600  # stale, never-closed sessions are purged after this
+QB_ALREADY_EXISTS_CODE = "3100"  # "name of list element is already in use"
 ACTIVE_TICKETS = {}
+
+
+# --- Sync State (prevents duplicate adds across runs) ---
+
+def load_synced_ids():
+    try:
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+def mark_synced(job_key):
+    synced = load_synced_ids()
+    synced.add(job_key)
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(sorted(synced), f, indent=2)
+    except OSError as e:
+        print(f"WARNING: Could not write {STATE_FILE}: {e}")
+
+
+def purge_stale_sessions():
+    cutoff = time.time() - SESSION_TTL_SECONDS
+    for ticket in [t for t, s in ACTIVE_TICKETS.items() if s["created"] < cutoff]:
+        del ACTIVE_TICKETS[ticket]
 
 # (Data arrays are unchanged from the previous version)
 
@@ -81,40 +113,40 @@ def write_to_log(log_data):
 def parse_qb_response(response_xml):
     """
     Parses the response XML from QuickBooks to find the status code and message.
-    Returns: {"status": "Success" | "Failed", "message": "..."}
+    Returns: {"status": "Success" | "Failed", "message": "...", "code": "..."}
     """
     if not response_xml:
-        return {"status": "Failed", "message": "Empty response from QuickBooks."}
-        
+        return {"status": "Failed", "message": "Empty response from QuickBooks.", "code": "-1"}
+
     try:
         root = ET.fromstring(response_xml)
-        
+
         # Find the ...Rs (response) tag. It's usually the first child of QBXMLMsgsRs.
         msgs_rs_node = root.find(".//QBXMLMsgsRs")
-        if msgs_rs_node is None:
-             # Find a single response, e.g. CustomerAddRs
-            response_node = root.find(".//*[contains(name(), 'Rs')]")
-            if response_node is None:
-                # Fallback for simple responses
-                response_node = root
+        if msgs_rs_node is not None and len(msgs_rs_node):
+            response_node = msgs_rs_node[0]
         else:
-             response_node = msgs_rs_node[0]
+            # ElementTree has no name() XPath function, so scan tags manually.
+            response_node = next(
+                (el for el in root.iter() if el.tag.endswith('Rs') and 'statusCode' in el.attrib),
+                None,
+            )
 
         if response_node is not None:
             status_code = response_node.attrib.get('statusCode', '-1')
             status_message = response_node.attrib.get('statusMessage', 'Unknown error')
-            
+
             if status_code == "0":
-                return {"status": "Success", "message": "OK"}
+                return {"status": "Success", "message": "OK", "code": status_code}
             else:
-                return {"status": "Failed", "message": f"Code {status_code}: {status_message}"}
+                return {"status": "Failed", "message": f"Code {status_code}: {status_message}", "code": status_code}
         else:
-            return {"status": "Failed", "message": "Could not parse response XML structure."}
+            return {"status": "Failed", "message": "Could not parse response XML structure.", "code": "-1"}
 
     except ET.ParseError as e:
-        return {"status": "Failed", "message": f"XML Parse Error: {e}"}
+        return {"status": "Failed", "message": f"XML Parse Error: {e}", "code": "-1"}
     except Exception as e:
-         return {"status": "Failed", "message": f"General parsing error: {e}"}
+         return {"status": "Failed", "message": f"General parsing error: {e}", "code": "-1"}
 
 
 # --- QBXML Generation Functions ---
@@ -154,7 +186,25 @@ def create_journal_entry_add_qbxml(entry, request_id):
 
 # --- SOAP Service Handler ---
 class QBWC_SOAP_Handler(http.server.BaseHTTPRequestHandler):
-    
+
+    def do_GET(self):
+        """Serves the AppSupport page referenced by the .qwc file."""
+        if self.path.split('?')[0] == '/support':
+            body = (
+                "<html><body><h1>QuickBooks Web Connector Sync Service</h1>"
+                f"<p>Sync results are logged to {html.escape(LOG_FILE)} on the server.</p>"
+                "</body></html>"
+            ).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+        else:
+            body = b"Not Found"
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         try:
             content_length = int(self.headers.get('Content-Length', 0))
@@ -206,29 +256,36 @@ class QBWC_SOAP_Handler(http.server.BaseHTTPRequestHandler):
         password = params.get('strPassword')
         print(f"QBWC: Called authenticate with user: {username}")
         
-        if username == QBWC_USERNAME and password == QBWC_PASSWORD:
+        if (hmac.compare_digest(str(username or ''), QBWC_USERNAME)
+                and hmac.compare_digest(str(password or ''), QBWC_PASSWORD)):
+            purge_stale_sessions()
             ticket = str(uuid.uuid4())
             sync_queue = []
-            
-            # Add retries: 0 to each job
-            for customer in CUSTOMERS_TO_SYNC:
-                sync_queue.append({"type": "customer", "id": customer['id'], "data": customer, "retries": 0})
-            for employee in EMPLOYEES_TO_SYNC:
-                sync_queue.append({"type": "employee", "id": employee['id'], "data": employee, "retries": 0})
-            for invoice in INVOICES_TO_SYNC:
-                sync_queue.append({"type": "invoice", "id": invoice['id'], "data": invoice, "retries": 0})
-            for entry in GL_ENTRIES_TO_SYNC:
-                sync_queue.append({"type": "gl_entry", "id": entry['id'], "data": entry, "retries": 0})
+            synced = load_synced_ids()
+            skipped = 0
+
+            all_jobs = (
+                [("customer", c) for c in CUSTOMERS_TO_SYNC]
+                + [("employee", e) for e in EMPLOYEES_TO_SYNC]
+                + [("invoice", i) for i in INVOICES_TO_SYNC]
+                + [("gl_entry", g) for g in GL_ENTRIES_TO_SYNC]
+            )
+            for job_type, record in all_jobs:
+                if f"{job_type}:{record['id']}" in synced:
+                    skipped += 1  # already in QuickBooks from a previous run
+                    continue
+                sync_queue.append({"type": job_type, "id": record['id'], "data": record, "retries": 0})
 
             ACTIVE_TICKETS[ticket] = {
                 "sync_queue": sync_queue,
                 "total_jobs": len(sync_queue),
                 "jobs_done": 0,
-                "current_job": None # To store the job currently in progress
+                "current_job": None, # To store the job currently in progress
+                "created": time.time()
             }
-            
+
             result_xml = f"<authenticateResult><string>{ticket}</string><string></string></authenticateResult>"
-            print(f"QBWC: Authentication Succeeded. {len(sync_queue)} jobs queued.")
+            print(f"QBWC: Authentication Succeeded. {len(sync_queue)} jobs queued, {skipped} already synced.")
         else:
             result_xml = f"<authenticateResult><string></string><string>nvu</string></authenticateResult>"
             print("QBWC: Authentication FAILED.")
@@ -307,8 +364,15 @@ class QBWC_SOAP_Handler(http.server.BaseHTTPRequestHandler):
         status = qb_status["status"]
         error_message = qb_status["message"]
         log_status = status # Default log status
-        
-        if status == "Failed":
+        job_key = f"{job['type']}:{job['id']}"
+
+        if status == "Failed" and qb_status.get("code") == QB_ALREADY_EXISTS_CODE:
+            # Record already exists in QuickBooks: retrying can never succeed.
+            mark_synced(job_key)
+            session["jobs_done"] += 1
+            log_status = "Skipped (Already Exists)"
+            print(f"QBWC: Job {job['type']} {job['id']} already exists in QuickBooks. Marked synced.")
+        elif status == "Failed":
             print(f"QBWC: Job {job['type']} {job['id']} FAILED. Reason: {error_message}")
             if job["retries"] < MAX_RETRIES:
                 job["retries"] += 1
@@ -322,6 +386,7 @@ class QBWC_SOAP_Handler(http.server.BaseHTTPRequestHandler):
         else:
             # Job was successful
             session["jobs_done"] += 1
+            mark_synced(job_key)
             print(f"QBWC: Job {job['type']} {job['id']} Succeeded.")
 
         # Write the detailed log

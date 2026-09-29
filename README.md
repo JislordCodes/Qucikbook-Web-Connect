@@ -18,9 +18,17 @@ For Invoices: An "Item" in your Item List named "Services".
 
 For Journal Entries: "Accounts" in your Chart of Accounts named "Checking" and "Office Expenses".
 
-If these do not exist, the InvoiceAddRq or JournalEntryAddRq will fail. You can edit the data arrays at the top of qbwc_service.py to match the items and accounts you do have in your file.
+If these do not exist, the InvoiceAddRq or JournalEntryAddRq will fail. You can edit the data arrays at the top of quickbooks_web_connector_service.py to match the items and accounts you do have in your file.
 
 I have intentionally included a failing job (Invoice "INV-FAIL-TEST") so you can see the retry logic and error logging in action.
+
+Credentials
+
+By default the service accepts username "testuser" / password "testpass" (demo only). Override them with the QBWC_USERNAME and QBWC_PASSWORD environment variables, and set the same username in the <UserName> line of Web_Connector_Config.qwc.
+
+Duplicate protection
+
+Jobs that succeed are recorded in sync_state.json, so later syncs skip them instead of re-adding them. A "name already in use" error (3100) from QuickBooks is treated as already synced. Delete sync_state.json to force a full re-sync. Because of this, INV-FAIL-TEST (which never succeeds) is retried on every sync.
 
 Step-by-Step Guide
 
@@ -34,9 +42,9 @@ Follow their instructions to add your "authtoken" (this is a one-time setup).
 
 2. Run the Python Service
 
-Open your terminal, navigate to the directory with qbwc_service.py, and run it:
+Open your terminal, navigate to the directory with quickbooks_web_connector_service.py, and run it:
 
-python qbwc_service.py
+python quickbooks_web_connector_service.py
 
 
 You should see: Starting QBWC SOAP Service on http://localhost:8000/...
@@ -60,7 +68,7 @@ Copy this HTTPS URL.
 
 4. Edit the .qwc File
 
-Open example.qwc (the file from our previous conversation) in a text editor.
+Open Web_Connector_Config.qwc (the file from our previous conversation) in a text editor.
 
 Find the <AppURL> line.
 
@@ -83,11 +91,11 @@ Add the Application:
 
 Click Add an Application.
 
-Select the example.qwc file you just edited.
+Select the Web_Connector_Config.qwc file you just edited.
 
 Authorize the service.
 
-Enter the password: testpass
+Enter the password: testpass (or the value of your QBWC_PASSWORD environment variable)
 
 Check the box on the far left and click Update Selected.
 
